@@ -1,0 +1,503 @@
+Identifying Human Activity Class from Accelerometer Data
+==========================================================================
+
+# Synopsis
+
+The Human Activity Recognition (HAR) dataset comprises data from various accelerometers worn on different spots by athletes while exercising.  Its outcome variable is a class of activity (sitting-down, standing-up, standing, walking and sitting).   The target of this project is to predict the activity type from the available accelerometer data.
+
+Here we have applied two training algorithms (decision tree and random forest), both to three predictor sets:
+
+1. The original predictor set available after data cleanup ("full," 53 variables), 
+2. A principal component set created which would explain 85% of variation available in the training data set ("PC85," 16 variables) 
+3. Another PCA-based set to explain 75% of variation available in the training data set ("PC75", 11 variables).  
+
+The provided "training" data set was divided into "internal training" and "internal test" sets by a 70-30 split.  Model development was carried out on the "internal training" set alone.  **5-fold cross-validation** was used with both training algorithms to estimate their out-of-sample (OOS) accuracies.  These were further compared to the prediction accuracy obtained from the "internal test" dataset to verify the goodness of the estimate.
+
+## Results-At-A-Glance
+
+The decision tree model runs fast enough that there is not much to be gained from using the PCA-based predictor sets compared to the full predictor set, and the accuracy hit from doing so is unacceptable.  The **estimated OOS accuracy** from this method with the full predictor set is **0.902**, while the measured OOS accuracy from an internal test set (the 30% of the original training dataset from the project that was set aside) is **0.894**. The accuracy was improved during model selection by setting the complexity parameter cp to be lower (forcing the algorithm to try a higher number of splits).
+
+The random forest model is slower and using the PCA-based predictor set gives a good trade-off between accuracy and speed in this case.  The **estimated OOS accuracy** from this method with the PC85 predictor set is **0.958**, while the measured OOS accuracy from an internal test set (30% of the original training dataset from the project was set aside) is **0.967**.   No further optimization was attempted with the random forest method in this work.  
+
+# Data Processing
+
+## Exploratory and Preparatory Work on the Dataset
+
+We first read in and explore the dataset, assumed to be in a subdirectory "data\".  We look at the variable names and look deeper into a few variables.  In particular, the variable **classe**, our outcome variable, is column no. 160 and should be disregarded in the analysis.  The variable **user_name** turns out to be a factor variable with six levels only, i.e. six individuals were exercising.  We read in the test data set as well, but don't do anything with it.
+
+```{r, echo=FALSE,cache=TRUE}
+library(caret)
+library(rpart)
+library(randomForest)
+pmltrain_in <- read.csv("data//pml-training.csv")
+pmltest_in <- read.csv("data//pml-testing.csv")
+#names(pmltrain_in)
+summary(pmltrain_in$classe) # outcome variable, variable no. 160
+summary(pmltrain_in$user_name) # six different people, apparently
+summary(pmltrain_in$X) # is the index number, don't use in analysis
+```
+
+The variable **X**, on the other hand, is the index number and should not be used in developing the model, especially since it turns out that the dataset is in fact ordered by outcome as any of the exploratory plots show.  Similarly, of the two timestamp variables, **raw_timestamp_part_1** is roughly ordered with **X**, and **raw_timestamp_part_2** probably has information about seconds since it is way too uniformly distributed, so it makes sense to ignore them in the analysis.  The **new_window** and **num_window** variables also seem about data acquisition information rather than data themselves and will be ignored.  Finally, plotting the class outcome vs. index colored by individual shows that all individuals performed all outcome classes, so we can take out **user_name** as well.  So we make a narrowed-down dataset from the training set: 
+
+```{r echo=TRUE, cache=TRUE,fig.width=7,fig.height=4}
+par(mfrow=c(1,3))
+
+plot(pmltrain_in$X,pmltrain_in$classe,xlab="index",ylab="classe")
+plot(pmltrain_in$X,pmltrain_in$num_window,col=pmltrain_in$classe,xlab="index", ylab="num_window", main="color by classe")
+plot(pmltrain_in$X,pmltrain_in$classe,col=pmltrain_in$user_name,xlab="index", ylab="classe",main="color by user")
+
+dropcols <- c("X","raw_timestamp_part_1","raw_timestamp_part_2",
+              "cvtd_timestamp","new_window","num_window","user_name")
+
+pmltrain <- pmltrain_in[,!(names(pmltrain_in) %in% dropcols)]
+
+```
+
+Viewing the dataframe shows that many of the variables have significant chunks of missing data, untaken measurements, and NAs.  There are also a number of values which (likely an Excel error) wrote out as "#DIV/0!".  Taking only those columns that have no data missing in them gets rid of these and NAs as well.  As a nice bonus, now all columns except the target outcome (**classe**) are numeric.
+
+
+```{r,echo=TRUE,cache=TRUE}
+
+missingvals <- sapply(pmltrain, function(x) sum(x=="") )
+divbyzeros <- sapply(pmltrain, function(x) sum(x=="#DIV/0!"))
+NAcounts <- sapply(pmltrain, function(x) sum(is.na(x)))
+mynames <- names(pmltrain)
+
+keepcols <- (missingvals==0)
+keepcols[is.na(keepcols)]<-FALSE
+pmltrain_full <- pmltrain[,(names(pmltrain) %in% mynames[keepcols==TRUE])]
+
+divbyzeros <- sapply(pmltrain_full, function(x) sum(x=="#DIV/0!"))
+NAcounts <- sapply(pmltrain_full, function(x) sum(is.na(x)))
+sum(divbyzeros)
+sum(NAcounts)
+#str(pmltrain_full)
+```
+
+
+## Preprocessing with PCA
+
+Looking at the names of the variables that are left shows that many of them come from the same sensor location, as expectable.  Therefore some degree of correlation might be expected, and it may make sense to use PCA before training.  We try 75 and 85 percent variations as the thresholds to be explained.  The code prints out how many variables are in the full dataset, how many in the 85% explanation case and how many for the 75% case.
+
+```{r, echo=TRUE, cache=TRUE}
+preProc_pmltrain_full_75 <- preProcess(pmltrain_full[,-53],
+                                       method='pca',thresh=0.75)
+pmltrain_PC75 <- predict(preProc_pmltrain_full_75,pmltrain_full[,-53])
+pmltrain_PC75$classe <- pmltrain_full$classe
+preProc_pmltrain_full_85 <- preProcess(pmltrain_full[,-53],
+                                       method='pca',thresh=0.85)
+pmltrain_PC85 <- predict(preProc_pmltrain_full_85,pmltrain_full[,-53])
+pmltrain_PC85$classe <- pmltrain_full$classe
+c(ncol(pmltrain_full),ncol(pmltrain_PC85),ncol(pmltrain_PC75))
+```
+
+## Splitting into internal test/training sets
+
+Now we split these into our own training and test set, here called variants of **pml_mytrain** and **pml_mytest**.  We do all the model training (including cross-validation to pick the parameter set) on **pml_mytrain** variants and estimate the out-of-sample accuracy with them.  At the very end, we will test the OOS accuracy with **pml_mytest**.
+
+```{r,echo=TRUE,cache=TRUE}
+set.seed(12345)
+inMyTrain <- createDataPartition(y=pmltrain_full$classe,p=0.7,list=FALSE)
+pml_full_mytrain <- pmltrain_full[inMyTrain,]
+pml_full_mytest <- pmltrain_full[-inMyTrain,]
+
+inMyTrain <- createDataPartition(y=pmltrain_PC75$classe,p=0.7,list=FALSE)
+pml_PC75_mytrain <- pmltrain_PC75[inMyTrain,]
+pml_PC75_mytest <- pmltrain_PC75[-inMyTrain,]
+
+inMyTrain <- createDataPartition(y=pmltrain_PC85$classe,p=0.7,list=FALSE)
+pml_PC85_mytrain <- pmltrain_PC85[inMyTrain,]
+pml_PC85_mytest <- pmltrain_PC85[-inMyTrain,]
+```
+
+## Creating folds for K-fold cross-validation
+
+Within the internal training sets we also create folds for use in k-fold cross-validation (k=5).  Using randomForest with train takes way too long to run, therefore we'll call rpart (for decision tree models) randomForest directly and implement our own CV for both approaches.
+
+
+```{r,echo=TRUE,cache=TRUE}
+set.seed(12345)
+folds_pmlfulltrain <- createFolds(y=pml_full_mytrain$classe,k=5,list=TRUE,returnTrain = TRUE)
+sapply(folds_pmlfulltrain,length)
+
+folds_pmlPC75train <- createFolds(y=pml_PC75_mytrain$classe,k=5,list=TRUE,returnTrain = TRUE)
+sapply(folds_pmlfulltrain,length)
+
+folds_pmlPC85train <- createFolds(y=pml_PC85_mytrain$classe,k=5,list=TRUE,returnTrain = TRUE)
+sapply(folds_pmlfulltrain,length)
+
+pml_full_mytrain_Kset1train = pml_full_mytrain[folds_pmlfulltrain[[1]],]
+pml_full_mytrain_Kset2train = pml_full_mytrain[folds_pmlfulltrain[[2]],]
+pml_full_mytrain_Kset3train = pml_full_mytrain[folds_pmlfulltrain[[3]],]
+pml_full_mytrain_Kset4train = pml_full_mytrain[folds_pmlfulltrain[[4]],]
+pml_full_mytrain_Kset5train = pml_full_mytrain[folds_pmlfulltrain[[5]],]
+pml_full_mytrain_Kset1test  = pml_full_mytrain[-folds_pmlfulltrain[[1]],]
+pml_full_mytrain_Kset2test  = pml_full_mytrain[-folds_pmlfulltrain[[2]],]
+pml_full_mytrain_Kset3test  = pml_full_mytrain[-folds_pmlfulltrain[[3]],]
+pml_full_mytrain_Kset4test  = pml_full_mytrain[-folds_pmlfulltrain[[4]],]
+pml_full_mytrain_Kset5test  = pml_full_mytrain[-folds_pmlfulltrain[[5]],]
+
+pml_PC75_mytrain_Kset1train = pml_PC75_mytrain[folds_pmlPC75train[[1]],]
+pml_PC75_mytrain_Kset2train = pml_PC75_mytrain[folds_pmlPC75train[[2]],]
+pml_PC75_mytrain_Kset3train = pml_PC75_mytrain[folds_pmlPC75train[[3]],]
+pml_PC75_mytrain_Kset4train = pml_PC75_mytrain[folds_pmlPC75train[[4]],]
+pml_PC75_mytrain_Kset5train = pml_PC75_mytrain[folds_pmlPC75train[[5]],]
+pml_PC75_mytrain_Kset1test = pml_PC75_mytrain[-folds_pmlPC75train[[1]],]
+pml_PC75_mytrain_Kset2test = pml_PC75_mytrain[-folds_pmlPC75train[[2]],]
+pml_PC75_mytrain_Kset3test = pml_PC75_mytrain[-folds_pmlPC75train[[3]],]
+pml_PC75_mytrain_Kset4test = pml_PC75_mytrain[-folds_pmlPC75train[[4]],]
+pml_PC75_mytrain_Kset5test = pml_PC75_mytrain[-folds_pmlPC75train[[5]],]
+
+pml_PC85_mytrain_Kset1train = pml_PC85_mytrain[folds_pmlPC85train[[1]],]
+pml_PC85_mytrain_Kset2train = pml_PC85_mytrain[folds_pmlPC85train[[2]],]
+pml_PC85_mytrain_Kset3train = pml_PC85_mytrain[folds_pmlPC85train[[3]],]
+pml_PC85_mytrain_Kset4train = pml_PC85_mytrain[folds_pmlPC85train[[4]],]
+pml_PC85_mytrain_Kset5train = pml_PC85_mytrain[folds_pmlPC85train[[5]],]
+pml_PC85_mytrain_Kset1test = pml_PC85_mytrain[-folds_pmlPC85train[[1]],]
+pml_PC85_mytrain_Kset2test = pml_PC85_mytrain[-folds_pmlPC85train[[2]],]
+pml_PC85_mytrain_Kset3test = pml_PC85_mytrain[-folds_pmlPC85train[[3]],]
+pml_PC85_mytrain_Kset4test = pml_PC85_mytrain[-folds_pmlPC85train[[4]],]
+pml_PC85_mytrain_Kset5test = pml_PC85_mytrain[-folds_pmlPC85train[[5]],]
+```
+
+# Training and Testing a Decision Tree Model
+
+The methodology here will be as follows: 
+
+* Train decision trees with the full complement of variables, and with the two PCA sets described above, for every one of the five-fold CV training sets.
+* Check and store the accuracy of every one of the five on the corresponding 5-fold CV test set 
+* Average the accuracy to estimate the accuracy of the out-of-sample test set
+
+First for the full predictor set:
+
+```{r, echo=TRUE,cache=TRUE}
+fitDT_full_Kset1 <- rpart(classe ~ ., data=pml_full_mytrain_Kset1train,cp=0.001)
+predDT_full_Kset1 <- predict(fitDT_full_Kset1,
+                             newdata = pml_full_mytrain_Kset1test[,-53],type="class")
+CMDT_full_Kset1 <- confusionMatrix(predDT_full_Kset1,pml_full_mytrain_Kset1test$classe)
+accDT_full_Kset1 <- CMDT_full_Kset1$overall[1]
+fitDT_full_Kset2 <- rpart(classe ~ ., data=pml_full_mytrain_Kset2train,cp=0.001)
+predDT_full_Kset2 <- predict(fitDT_full_Kset2,
+                             newdata = pml_full_mytrain_Kset2test[,-53],type="class")
+CMDT_full_Kset2 <- confusionMatrix(predDT_full_Kset2,pml_full_mytrain_Kset2test$classe)
+accDT_full_Kset2 <- CMDT_full_Kset2$overall[1]
+fitDT_full_Kset3 <- rpart(classe ~ ., data=pml_full_mytrain_Kset3train,cp=0.001)
+predDT_full_Kset3 <- predict(fitDT_full_Kset3,
+                             newdata = pml_full_mytrain_Kset3test[,-53],type="class")
+CMDT_full_Kset3 <- confusionMatrix(predDT_full_Kset3,pml_full_mytrain_Kset3test$classe)
+accDT_full_Kset3 <- CMDT_full_Kset3$overall[1]
+fitDT_full_Kset4 <- rpart(classe ~ ., data=pml_full_mytrain_Kset4train,cp=0.001)
+predDT_full_Kset4 <- predict(fitDT_full_Kset4,
+                             newdata = pml_full_mytrain_Kset4test[,-53],type="class")
+CMDT_full_Kset4 <- confusionMatrix(predDT_full_Kset4,pml_full_mytrain_Kset4test$classe)
+accDT_full_Kset4 <- CMDT_full_Kset4$overall[1]
+fitDT_full_Kset5 <- rpart(classe ~ ., data=pml_full_mytrain_Kset5train,cp=0.001)
+predDT_full_Kset5 <- predict(fitDT_full_Kset5,
+                             newdata = pml_full_mytrain_Kset5test[,-53],type="class")
+CMDT_full_Kset5 <- confusionMatrix(predDT_full_Kset5,pml_full_mytrain_Kset5test$classe)
+accDT_full_Kset5 <- CMDT_full_Kset5$overall[1]
+
+fullDTtrain_accuracy <- c(accDT_full_Kset1,accDT_full_Kset2,accDT_full_Kset3,
+                          accDT_full_Kset4,accDT_full_Kset5)
+fullDTtrain_OOSacc_estimate <- mean(fullDTtrain_accuracy)
+fullDTtrain_accuracy
+fullDTtrain_OOSacc_estimate
+```
+
+
+A point of interest is why the parameter **cp** is set in the trainer function rpart.  This is the complexity parameter (see ?rpart for description).  Reducing this parameter from its default value of 0.01 increases the number of splits the algorithm attempts, which may result in better accuracy at the cost of performance.  On this computer system, reducing cp to 0.001 has not resulted in a sizeable performance hit, but increased the accuracy to approximately 0.9 from 0.74.  The following section uses the first K-fold set to demonstrate this graphically:
+
+```{r, echo=TRUE, cache=TRUE,fig.width=7.0,fig.height=4}
+fitDT_full_Kset1_defaultcp <- rpart(classe ~ ., data=pml_full_mytrain_Kset1train)
+predDT_full_Kset1_defaultcp <- predict(fitDT_full_Kset1_defaultcp,
+                             newdata = pml_full_mytrain_Kset1test[,-53],type="class")
+CMDT_full_Kset1_defaultcp <- confusionMatrix(predDT_full_Kset1_defaultcp,
+                                           pml_full_mytrain_Kset1test$classe)
+accDT_full_Kset1_defaultcp <- CMDT_full_Kset1_defaultcp$overall[1]
+c(accDT_full_Kset1,accDT_full_Kset1_defaultcp)
+par(mfrow=c(1,2))
+plot(pml_full_mytrain_Kset1test$classe,predDT_full_Kset1,
+     xlab="Actual",ylab="Predicted",main="cp=0.001")
+
+plot(pml_full_mytrain_Kset1test$classe,predDT_full_Kset1_defaultcp,
+     xlab="Actual",main="cp=0.01 (default)")
+
+```
+
+Next for the PCA set which explains 85% of variation:
+
+```{r, echo=TRUE,cache=TRUE}
+fitDT_PC85_Kset1 <- rpart(classe ~ ., data=pml_PC85_mytrain_Kset1train,cp=0.001)
+predDT_PC85_Kset1 <- predict(fitDT_PC85_Kset1,
+                             newdata = pml_PC85_mytrain_Kset1test[,-53],type="class")
+CMDT_PC85_Kset1 <- confusionMatrix(predDT_PC85_Kset1,pml_PC85_mytrain_Kset1test$classe)
+accDT_PC85_Kset1 <- CMDT_PC85_Kset1$overall[1]
+fitDT_PC85_Kset2 <- rpart(classe ~ ., data=pml_PC85_mytrain_Kset2train,cp=0.001)
+predDT_PC85_Kset2 <- predict(fitDT_PC85_Kset2,
+                             newdata = pml_PC85_mytrain_Kset2test[,-53],type="class")
+CMDT_PC85_Kset2 <- confusionMatrix(predDT_PC85_Kset2,pml_PC85_mytrain_Kset2test$classe)
+accDT_PC85_Kset2 <- CMDT_PC85_Kset2$overall[1]
+fitDT_PC85_Kset3 <- rpart(classe ~ ., data=pml_PC85_mytrain_Kset3train,cp=0.001)
+predDT_PC85_Kset3 <- predict(fitDT_PC85_Kset3,
+                             newdata = pml_PC85_mytrain_Kset3test[,-53],type="class")
+CMDT_PC85_Kset3 <- confusionMatrix(predDT_PC85_Kset3,pml_PC85_mytrain_Kset3test$classe)
+accDT_PC85_Kset3 <- CMDT_PC85_Kset3$overall[1]
+fitDT_PC85_Kset4 <- rpart(classe ~ ., data=pml_PC85_mytrain_Kset4train,cp=0.001)
+predDT_PC85_Kset4 <- predict(fitDT_PC85_Kset4,
+                             newdata = pml_PC85_mytrain_Kset4test[,-53],type="class")
+CMDT_PC85_Kset4 <- confusionMatrix(predDT_PC85_Kset4,pml_PC85_mytrain_Kset4test$classe)
+accDT_PC85_Kset4 <- CMDT_PC85_Kset4$overall[1]
+fitDT_PC85_Kset5 <- rpart(classe ~ ., data=pml_PC85_mytrain_Kset5train,cp=0.001)
+predDT_PC85_Kset5 <- predict(fitDT_PC85_Kset5,
+                             newdata = pml_PC85_mytrain_Kset5test[,-53],type="class")
+CMDT_PC85_Kset5 <- confusionMatrix(predDT_PC85_Kset5,pml_PC85_mytrain_Kset5test$classe)
+accDT_PC85_Kset5 <- CMDT_PC85_Kset5$overall[1]
+
+PC85DTtrain_accuracy <- c(accDT_PC85_Kset1,accDT_PC85_Kset2,accDT_PC85_Kset3,
+                          accDT_PC85_Kset4,accDT_PC85_Kset5)
+PC85DTtrain_OOSacc_estimate <- mean(PC85DTtrain_accuracy)
+PC85DTtrain_accuracy
+PC85DTtrain_OOSacc_estimate
+```
+
+Last for the PCA set which explains 75% of variation:
+
+```{r, echo=TRUE,cache=TRUE}
+fitDT_PC75_Kset1 <- rpart(classe ~ ., data=pml_PC75_mytrain_Kset1train,cp=0.001)
+predDT_PC75_Kset1 <- predict(fitDT_PC75_Kset1,
+                             newdata = pml_PC75_mytrain_Kset1test[,-53],type="class")
+CMDT_PC75_Kset1 <- confusionMatrix(predDT_PC75_Kset1,pml_PC75_mytrain_Kset1test$classe)
+accDT_PC75_Kset1 <- CMDT_PC75_Kset1$overall[1]
+fitDT_PC75_Kset2 <- rpart(classe ~ ., data=pml_PC75_mytrain_Kset2train,cp=0.001)
+predDT_PC75_Kset2 <- predict(fitDT_PC75_Kset2,
+                             newdata = pml_PC75_mytrain_Kset2test[,-53],type="class")
+CMDT_PC75_Kset2 <- confusionMatrix(predDT_PC75_Kset2,pml_PC75_mytrain_Kset2test$classe)
+accDT_PC75_Kset2 <- CMDT_PC75_Kset2$overall[1]
+fitDT_PC75_Kset3 <- rpart(classe ~ ., data=pml_PC75_mytrain_Kset3train,cp=0.001)
+predDT_PC75_Kset3 <- predict(fitDT_PC75_Kset3,
+                             newdata = pml_PC75_mytrain_Kset3test[,-53],type="class")
+CMDT_PC75_Kset3 <- confusionMatrix(predDT_PC75_Kset3,pml_PC75_mytrain_Kset3test$classe)
+accDT_PC75_Kset3 <- CMDT_PC75_Kset3$overall[1]
+fitDT_PC75_Kset4 <- rpart(classe ~ ., data=pml_PC75_mytrain_Kset4train,cp=0.001)
+predDT_PC75_Kset4 <- predict(fitDT_PC75_Kset4,
+                             newdata = pml_PC75_mytrain_Kset4test[,-53],type="class")
+CMDT_PC75_Kset4 <- confusionMatrix(predDT_PC75_Kset4,pml_PC75_mytrain_Kset4test$classe)
+accDT_PC75_Kset4 <- CMDT_PC75_Kset4$overall[1]
+fitDT_PC75_Kset5 <- rpart(classe ~ ., data=pml_PC75_mytrain_Kset5train,cp=0.001)
+predDT_PC75_Kset5 <- predict(fitDT_PC75_Kset5,
+                             newdata = pml_PC75_mytrain_Kset5test[,-53],type="class")
+CMDT_PC75_Kset5 <- confusionMatrix(predDT_PC75_Kset5,pml_PC75_mytrain_Kset5test$classe)
+accDT_PC75_Kset5 <- CMDT_PC75_Kset5$overall[1]
+
+PC75DTtrain_accuracy <- c(accDT_PC75_Kset1,accDT_PC75_Kset2,accDT_PC75_Kset3,
+                          accDT_PC75_Kset4,accDT_PC75_Kset5)
+PC75DTtrain_OOSacc_estimate <- mean(PC75DTtrain_accuracy)
+PC75DTtrain_accuracy
+PC75DTtrain_OOSacc_estimate
+```
+
+To summarize:
+
+* The **full** predictor set gives an expected OOS accuracy of **`r fullDTtrain_OOSacc_estimate`**
+* The **PCA, 85% var. expl.** predictor set gives an expected OOS accuracy of **`r PC85DTtrain_OOSacc_estimate`**
+* The **PCA, 75% var. expl.** predictor set gives an expected OOS accuracy of **`r PC75DTtrain_OOSacc_estimate`**
+
+As can be expected, the latter two perform worse than the full predictor set (with 53) predictors, since PCA does lose some information though it helps with speed.  On this computer system, the full predictor set is not too slow to run for the 5-fold CV training sets, which are approximately 80% the size of the full internal training set, so  it is reasonable to take the computing time hit for accuracy.  
+
+## Testing The Decision Tree Model
+
+It is possible that the increased accuracy by setting the **cp** parameter has resulted in overfitting.  To evaluate if this is acceptable, we also predict results from the "internal" test set we had set aside.
+
+```{r, echo=TRUE, cache=TRUE}
+fitDT_full <- rpart(classe ~ ., data=pml_full_mytrain,cp=0.001)
+predDT_full <- predict(fitDT_full, newdata = pml_full_mytest[,-53],type="class")
+cMDT_full <- confusionMatrix(predDT_full,pml_full_mytest$classe)
+accDT_full <- cMDT_full$overall[1]
+```
+
+The internal test set which was set aside before K-fold cross-validation training can be predicted with an accuracy of **`r accDT_full`**, while the estimated OOS accuracy was  **`r fullDTtrain_OOSacc_estimate`** from 5-fold cross-validation on the internal training set.  Since these are rather close (the difference is 0.89%), overfitting is not unacceptable in this case.
+
+
+
+# Training and Testing a Random Forest Model
+
+The methodology here follows the same path as the decision tree model: 
+
+* Train random forests with the full complement of variables, and with the two PCA sets described above, for every one of the five-fold CV training sets.
+* Check and store the accuracy of every one of the five on the corresponding 5-fold CV test set 
+* Average the accuracy to estimate the accuracy of the out-of-sample test set
+
+First for the full predictor set:
+
+```{r, echo=TRUE,cache=TRUE}
+fitRF_full_Kset1 <- randomForest(classe ~ ., data=pml_full_mytrain_Kset1train)
+predRF_full_Kset1 <- predict(fitRF_full_Kset1,
+                             newdata = pml_full_mytrain_Kset1test[,-53],type="class")
+cMRF_full_Kset1 <- confusionMatrix(predRF_full_Kset1,pml_full_mytrain_Kset1test$classe)
+accRF_full_Kset1 <- cMRF_full_Kset1$overall[1]
+fitRF_full_Kset2 <- randomForest(classe ~ ., data=pml_full_mytrain_Kset2train)
+predRF_full_Kset2 <- predict(fitRF_full_Kset2,
+                             newdata = pml_full_mytrain_Kset2test[,-53],type="class")
+cMRF_full_Kset2 <- confusionMatrix(predRF_full_Kset2,pml_full_mytrain_Kset2test$classe)
+accRF_full_Kset2 <- cMRF_full_Kset2$overall[1]
+fitRF_full_Kset3 <- randomForest(classe ~ ., data=pml_full_mytrain_Kset3train)
+predRF_full_Kset3 <- predict(fitRF_full_Kset3,
+                             newdata = pml_full_mytrain_Kset3test[,-53],type="class")
+cMRF_full_Kset3 <- confusionMatrix(predRF_full_Kset3,pml_full_mytrain_Kset3test$classe)
+accRF_full_Kset3 <- cMRF_full_Kset3$overall[1]
+fitRF_full_Kset4 <- randomForest(classe ~ ., data=pml_full_mytrain_Kset4train)
+predRF_full_Kset4 <- predict(fitRF_full_Kset4,
+                             newdata = pml_full_mytrain_Kset4test[,-53],type="class")
+cMRF_full_Kset4 <- confusionMatrix(predRF_full_Kset4,pml_full_mytrain_Kset4test$classe)
+accRF_full_Kset4 <- cMRF_full_Kset4$overall[1]
+fitRF_full_Kset5 <- randomForest(classe ~ ., data=pml_full_mytrain_Kset5train)
+predRF_full_Kset5 <- predict(fitRF_full_Kset5,
+                             newdata = pml_full_mytrain_Kset5test[,-53],type="class")
+cMRF_full_Kset5 <- confusionMatrix(predDT_full_Kset5,pml_full_mytrain_Kset5test$classe)
+accRF_full_Kset5 <- cMRF_full_Kset5$overall[1]
+
+fullRFtrain_accuracy <- c(accRF_full_Kset1,accRF_full_Kset2,accRF_full_Kset3,
+                          accRF_full_Kset4,accRF_full_Kset5)
+fullRFtrain_OOSacc_estimate <- mean(fullRFtrain_accuracy)
+fullRFtrain_accuracy
+fullRFtrain_OOSacc_estimate
+```
+
+
+While for the decision trees the obtained estimate for out-of-sample accuracy was too low to be accepted for the use of alternative predictor sets created with PCA, the base estimated OOS accuracy for the "full" predictor set for randomForest is very high (>95%).  The randomForest method is also considerably slower to run.  This may make the performance/accuracy tradeoff swing the other way for random forests.  Therefore we train the random forests with the PCA sets as well.
+
+For the PCA set which explains 85% of variation:
+
+```{r, echo=TRUE,cache=TRUE}
+fitRF_PC85_Kset1 <- randomForest(classe ~ ., data=pml_PC85_mytrain_Kset1train)
+predRF_PC85_Kset1 <- predict(fitRF_PC85_Kset1,
+                             newdata = pml_PC85_mytrain_Kset1test[,-53],
+                             type="class")
+cMRF_PC85_Kset1 <- confusionMatrix(predRF_PC85_Kset1,pml_PC85_mytrain_Kset1test$classe)
+accRF_PC85_Kset1 <- cMRF_PC85_Kset1$overall[1]
+fitRF_PC85_Kset2 <- randomForest(classe ~ ., data=pml_PC85_mytrain_Kset2train)
+predRF_PC85_Kset2 <- predict(fitRF_PC85_Kset2,
+                             newdata = pml_PC85_mytrain_Kset2test[,-53],type="class")
+cMRF_PC85_Kset2 <- confusionMatrix(predRF_PC85_Kset2,pml_PC85_mytrain_Kset2test$classe)
+accRF_PC85_Kset2 <- cMRF_PC85_Kset2$overall[1]
+fitRF_PC85_Kset3 <- randomForest(classe ~ ., data=pml_PC85_mytrain_Kset3train)
+predRF_PC85_Kset3 <- predict(fitRF_PC85_Kset3,
+                             newdata = pml_PC85_mytrain_Kset3test[,-53],type="class")
+cMRF_PC85_Kset3 <- confusionMatrix(predRF_PC85_Kset3,pml_PC85_mytrain_Kset3test$classe)
+accRF_PC85_Kset3 <- cMRF_PC85_Kset3$overall[1]
+fitRF_PC85_Kset4 <- randomForest(classe ~ ., data=pml_PC85_mytrain_Kset4train)
+predRF_PC85_Kset4 <- predict(fitRF_PC85_Kset4,
+                             newdata = pml_PC85_mytrain_Kset4test[,-53],type="class")
+cMRF_PC85_Kset4 <- confusionMatrix(predRF_PC85_Kset4,pml_PC85_mytrain_Kset4test$classe)
+accRF_PC85_Kset4 <- cMRF_PC85_Kset4$overall[1]
+fitRF_PC85_Kset5 <- randomForest(classe ~ ., data=pml_PC85_mytrain_Kset5train)
+predRF_PC85_Kset5 <- predict(fitRF_PC85_Kset5,
+                             newdata = pml_PC85_mytrain_Kset5test[,-53],type="class")
+cMRF_PC85_Kset5 <- confusionMatrix(predRF_PC85_Kset5,pml_PC85_mytrain_Kset5test$classe)
+accRF_PC85_Kset5 <- cMRF_PC85_Kset5$overall[1]
+
+PC85RFtrain_accuracy <- c(accRF_PC85_Kset1,accRF_PC85_Kset2,accRF_PC85_Kset3,
+                          accRF_PC85_Kset4,accRF_PC85_Kset5)
+PC85RFtrain_OOSacc_estimate <- mean(PC85RFtrain_accuracy)
+PC85RFtrain_accuracy
+PC85RFtrain_OOSacc_estimate
+```
+
+Lastly, for the PCA set which explains 75% of variation:
+
+```{r, echo=TRUE,cache=TRUE}
+fitRF_PC75_Kset1 <- randomForest(classe ~ ., data=pml_PC75_mytrain_Kset1train)
+predRF_PC75_Kset1 <- predict(fitRF_PC75_Kset1,
+                             newdata = pml_PC75_mytrain_Kset1test[,-53],
+                             type="class")
+cMRF_PC75_Kset1 <- confusionMatrix(predRF_PC75_Kset1,pml_PC75_mytrain_Kset1test$classe)
+accRF_PC75_Kset1 <- cMRF_PC75_Kset1$overall[1]
+fitRF_PC75_Kset2 <- randomForest(classe ~ ., data=pml_PC75_mytrain_Kset2train)
+predRF_PC75_Kset2 <- predict(fitRF_PC75_Kset2,
+                             newdata = pml_PC75_mytrain_Kset2test[,-53],type="class")
+cMRF_PC75_Kset2 <- confusionMatrix(predRF_PC75_Kset2,pml_PC75_mytrain_Kset2test$classe)
+accRF_PC75_Kset2 <- cMRF_PC75_Kset2$overall[1]
+fitRF_PC75_Kset3 <- randomForest(classe ~ ., data=pml_PC75_mytrain_Kset3train)
+predRF_PC75_Kset3 <- predict(fitRF_PC75_Kset3,
+                             newdata = pml_PC75_mytrain_Kset3test[,-53],type="class")
+cMRF_PC75_Kset3 <- confusionMatrix(predRF_PC75_Kset3,pml_PC75_mytrain_Kset3test$classe)
+accRF_PC75_Kset3 <- cMRF_PC75_Kset3$overall[1]
+fitRF_PC75_Kset4 <- randomForest(classe ~ ., data=pml_PC75_mytrain_Kset4train)
+predRF_PC75_Kset4 <- predict(fitRF_PC75_Kset4,
+                             newdata = pml_PC75_mytrain_Kset4test[,-53],type="class")
+cMRF_PC75_Kset4 <- confusionMatrix(predRF_PC75_Kset4,pml_PC75_mytrain_Kset4test$classe)
+accRF_PC75_Kset4 <- cMRF_PC75_Kset4$overall[1]
+fitRF_PC75_Kset5 <- randomForest(classe ~ ., data=pml_PC75_mytrain_Kset5train)
+predRF_PC75_Kset5 <- predict(fitRF_PC75_Kset5,
+                             newdata = pml_PC75_mytrain_Kset5test[,-53],type="class")
+cMRF_PC75_Kset5 <- confusionMatrix(predRF_PC75_Kset5,pml_PC75_mytrain_Kset5test$classe)
+accRF_PC75_Kset5 <- cMRF_PC75_Kset5$overall[1]
+
+PC75RFtrain_accuracy <- c(accRF_PC75_Kset1,accRF_PC75_Kset2,accRF_PC75_Kset3,
+                          accRF_PC75_Kset4,accRF_PC75_Kset5)
+PC75RFtrain_OOSacc_estimate <- mean(PC75RFtrain_accuracy)
+PC75RFtrain_accuracy
+PC75RFtrain_OOSacc_estimate
+```
+
+To summarize:
+
+* The **full** predictor set gives an expected OOS accuracy of **`r fullRFtrain_OOSacc_estimate`**
+* The **PCA, 85% var. expl.** predictor set gives an expected OOS accuracy of **`r PC85RFtrain_OOSacc_estimate`**
+* The **PCA, 75% var. expl.** predictor set gives an expected OOS accuracy of **`r PC75RFtrain_OOSacc_estimate`**
+
+Once again the PCA predictor sets have worse performance, but work much faster (average 25 seconds for random forest fit with the full parameter set, 16 seconds for PC85, 11 seconds for PC75).  This time it is reasonable to trade-off accuracy for computing time, especially since the drop in accuracy from the full parameter set to the PCA-based sets is not as pronounced for random forests as it was for decision trees.  As a medium point between the two considerations, training on the parameter set **PC85** is implemented for extra validation with the internal test set.
+
+## Testing The Random Forest Model
+
+To evaluate if the increased accuracy of the random forest model with respect to the decision tree model has caused overfitting, we also predict results from the "internal" test set we had set aside.
+
+```{r, echo=TRUE, cache=TRUE}
+fitRF_PC85 <- randomForest(classe ~ ., data=pml_PC85_mytrain)
+predRF_PC85 <- predict(fitRF_PC85, newdata = pml_PC85_mytest[,-53],type="class")
+cMRF_PC85 <- confusionMatrix(predRF_PC85,pml_PC85_mytest$classe)
+accRF_PC85 <- cMRF_PC85$overall[1]
+```
+
+The internal test set which was set aside before K-fold cross-validation training can be predicted with an accuracy of **`r accRF_PC85`**, while the estimated OOS accuracy was estimated to be  **`r PC85RFtrain_OOSacc_estimate`** from 5-fold cross-validation on the internal training set modified to include the PC85 parameter set.  Since these are rather close and in fact the validation set result seems more accurate due to random chance, overfitting is not unacceptable in this case.
+
+# Conclusions and Summary
+
+Here we have applied two training algorithms (decision tree and random forest) with three predictor sets: The original predictor set available after data cleanup ("full,"" 53 variables), a principal component set created which would explain 85% of variation available in the training data set ("PC85," 16 variables), and another to explain 75% of variation available in the training data set ("PC75", 11 variables).  
+
+The decision tree model runs fast enough that there is not much to be gained from using the PCA-based predictor sets compared to the full predictor set, and the accuracy hit from doing so is unacceptable.  The **estimated OOS accuracy** from this method with the full predictor set is **`r fullDTtrain_OOSacc_estimate`**, while the measured OOS accuracy from an internal test set (30% of the original training dataset from the project was set aside) is **`r accDT_full`** The accuracy was improved during model selection by setting the complexity parameter cp to be lower (forcing the algorithm to try a higher number of splits).
+
+The random forest model is slower and using the PCA-based predictor set gives a good trade-off between accuracy and speed in this case.  The **estimated OOS accuracy** from this method with the PC85 predictor set is **`r PC85RFtrain_OOSacc_estimate`**, while the measured OOS accuracy from an internal test set (30% of the original training dataset from the project was set aside) is **`r accRF_PC85`**.   No further optimization was attempted with the random forest method in this work.  
+
+The original test set (from the file pml-testing.csv) was not used either to train or to predict within this work.  This is to prevent overfitting.  The following code trains the 
+random forest model with the full pml-training.csv data set and creates the prediction file in order to prepare for submission of the programming assignment.
+
+Note that the original test set has to go through exactly the same pre-processing steps the training set has gone through in this work.
+
+```{r echo=TRUE, cache=TRUE}
+pmltest <- pmltest_in[,!(names(pmltest_in) %in% dropcols)]
+missingvalstest <- sapply(pmltest, function(x) sum(x=="") )
+divbyzerostest <- sapply(pmltest, function(x) sum(x=="#DIV/0!"))
+NAcountstest <- sapply(pmltest, function(x) sum(is.na(x)))
+mynamestest <- names(pmltest)
+
+keepcolstest <- (missingvalstest==0)
+keepcolstest[is.na(keepcolstest)]<-FALSE
+pmltest_full <- pmltest[,(names(pmltest) %in% mynamestest[keepcolstest==TRUE])]
+divbyzerostest <- sapply(pmltest_full, function(x) sum(x=="#DIV/0!"))
+NAcountstest <- sapply(pmltest_full, function(x) sum(is.na(x)))
+
+pmltest_PC85 <- predict(preProc_pmltrain_full_85,pmltest_full[,-53])
+c(ncol(pmltest_full),ncol(pmltest_PC85))
+fitRF_PC85_originaltrain <- randomForest(classe ~ ., data=pmltrain_PC85)
+predRF_PC85_origtest <- predict(fitRF_PC85_originaltrain,
+                                newdata = pmltest_PC85,type="class")
+
+answers <- as.character(predRF_PC85_origtest)
+```
+
+### References
+
+* Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. "Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements." *Proceedings of 21st Brazilian Symposium on Artificial Intelligence. Advances in Artificial Intelligence - SBIA 2012*. In: *Lecture Notes in Computer Science* , pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6. 
+* rpart documentation in R
+* Cross-validation lab notes from Johns Hopkins University, http://www.biostat.jhsph.edu/~iruczins/teaching/kogo/ml/week5/crossvalidation.Rmd, last visited November 2014
